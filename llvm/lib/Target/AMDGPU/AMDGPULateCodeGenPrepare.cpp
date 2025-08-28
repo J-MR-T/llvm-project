@@ -289,7 +289,8 @@ Value *LiveRegOptimizer::convertFromOptType(Type *ConvertType, Instruction *V,
 }
 
 bool LiveRegOptimizer::optimizeLiveType(
-    Instruction *I, SmallVectorImpl<WeakTrackingVH> &DeadInsts, UniformityAnalysisUpdater& UAUpdater) {
+    Instruction *I, SmallVectorImpl<WeakTrackingVH> &DeadInsts,
+    UniformityAnalysisUpdater &UAUpdater) {
   SmallVector<Instruction *, 4> Worklist;
   SmallPtrSet<PHINode *, 4> PhiNodes;
   SmallPtrSet<Instruction *, 4> Defs;
@@ -436,9 +437,10 @@ bool LiveRegOptimizer::optimizeLiveType(
           }
         }
         assert(NewVal);
-        Value* OldVal = Op;
+        Value *OldVal = Op;
         U->setOperand(OpIdx, NewVal);
-        // TODO dyn_cast - should always be allowed though? Replace with cast<> in that case
+        // TODO dyn_cast - should always be allowed though? Replace with cast<>
+        // in that case
         UAUpdater.informAboutRAUW(OldVal, dyn_cast<Instruction>(NewVal));
       }
     }
@@ -469,7 +471,7 @@ bool AMDGPULateCodeGenPrepare::canWidenScalarExtLoad(LoadInst &LI) const {
     return false;
   // It should be uniform, i.e. a scalar load.
   return UAUpdater.isUniform(&LI);
-  //return UAUpdater.Info.isUniform(&LI);
+  // return UAUpdater.Info.isUniform(&LI);
 }
 
 bool AMDGPULateCodeGenPrepare::visitLoadInst(LoadInst &LI) {

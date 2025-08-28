@@ -27,7 +27,8 @@ template <typename ImplT> struct GenericUniformityAnalysisImplDeleter {
 };
 
 template <typename ContextT> class GenericUniformityInfo {
-    friend class UniformityAnalysisUpdater;
+  friend class UniformityAnalysisUpdater;
+
 public:
   using BlockT = typename ContextT::BlockT;
   using FunctionT = typename ContextT::FunctionT;
