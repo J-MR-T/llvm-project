@@ -51,7 +51,6 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SparseBitVector.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "uniformity"
 
@@ -59,6 +58,8 @@ namespace llvm {
 
 // Forward decl from llvm/CodeGen/MachineInstr.h
 class MachineInstr;
+
+class Instruction;
 
 /// Construct a specially modified post-order traversal of cycles.
 ///
@@ -138,6 +139,14 @@ private:
                       const CycleInfoT &CI, const CycleT *Cycle,
                       SmallPtrSetImpl<const BlockT *> &Finalized);
 };
+
+namespace ValueClassification{
+  // enum inside a namespace, instead of an enum class, to be able to use it as the int in an llvm::PointerIntPair
+enum Type {
+  DIVERGENT,
+  UNIFORM
+};
+} // namespace ValueClassification
 
 template <typename> class DivergencePropagator;
 
@@ -260,15 +269,13 @@ template <typename> class DivergencePropagator;
 //     SIAM Journal on Computing, 4(4):519–532, December 1975.
 //
 template <typename ContextT> class GenericSyncDependenceAnalysis {
+    friend class UniformityAnalysisUpdater;
+
 public:
   using BlockT = typename ContextT::BlockT;
   using DominatorTreeT = typename ContextT::DominatorTreeT;
-  using FunctionT = typename ContextT::FunctionT;
-  using ValueRefT = typename ContextT::ValueRefT;
-  using InstructionT = typename ContextT::InstructionT;
 
   using CycleInfoT = GenericCycleInfo<ContextT>;
-  using CycleT = typename CycleInfoT::CycleT;
 
   using ConstBlockSet = SmallPtrSet<const BlockT *, 4>;
   using ModifiedPO = ModifiedPostOrder<ContextT>;
@@ -328,6 +335,10 @@ private:
 /// from sources of divergence to all users. It can be instantiated
 /// for an IR that provides a suitable SSAContext.
 template <typename ContextT> class GenericUniformityAnalysisImpl {
+    friend class UniformityAnalysisUpdater;
+
+    // TODO confirm that these changes don't negatively affect the MIR version of the analysis, as long as its not updatable
+
 public:
   using BlockT = typename ContextT::BlockT;
   using FunctionT = typename ContextT::FunctionT;
@@ -360,6 +371,8 @@ public:
   /// \brief Mark \p UniVal as a value that is always uniform.
   void addUniformOverride(const InstructionT &Instr);
 
+  // TODO In markDivergent, the overload returning void automatically adds the value to the worklist, while the overload returning bool does not, and instead returns whether the value was newly marked divergent. This is a confusing API and should likely be refactored.
+
   /// \brief Examine \p I for divergent outputs and add to the worklist.
   void markDivergent(const InstructionT &I);
 
@@ -371,12 +384,20 @@ public:
   /// \returns Whether the tracked divergence state of any output has changed.
   bool markDefsDivergent(const InstructionT &Instr);
 
+  // TODO This is not a super elegant solution, but a unified `mark` method that takes divergent vs uniform as an argument is even less readable.
+  //      Also make clearer that this can only *initially* mark things as uniform, not (yet) overwrite a divergent value with a uniform one.
+  /// \brief *Initially* mark \p UnifVal as a uniform value, to possibly be overwritten later. It would be unsafe to mark divergent values uniform again, because it would require reanalysing more values (see UniformityAnalysisUpdater::isDivergent)
+  void initiallyMarkUniform(ConstValueRefT UnifVal);
+
   /// \brief Propagate divergence to all instructions in the region.
   /// Divergence is seeded by calls to \p markDivergent.
   void compute();
 
-  /// \brief Whether any value was marked or analyzed to be divergent.
-  bool hasDivergence() const { return !DivergentValues.empty(); }
+  /// \brief Propagate the divergence with which the worklist has been seeded to the users of those instructions
+  /// All values on the Worklist are divergent.
+  /// Their users may not have been updated yet.
+  void propagateSeededWorklistDivergence();
+
 
   /// \brief Whether \p Val will always return a uniform value regardless of its
   /// operands
@@ -392,7 +413,12 @@ public:
   };
 
   /// \brief Whether \p Val is divergent at its definition.
-  bool isDivergent(ConstValueRefT V) const { return DivergentValues.count(V); }
+  bool isDivergent(ConstValueRefT V) const {
+    if(auto It = KnownValues.find(V); It != KnownValues.end()){
+      return It->second == ValueClassification::DIVERGENT;
+    }
+    return false;
+  }
 
   bool isDivergentUse(const UseT &U) const;
 
@@ -422,12 +448,15 @@ protected:
   const CycleInfoT &CI;
   const TargetTransformInfo *TTI = nullptr;
 
-  // Detected/marked divergent values.
-  DenseSet<ConstValueRefT> DivergentValues;
+  // Detected/marked values.
+  // KnownValues does not include terminators, divergent terminators are not stored explicitly, their parent blocks are inserted into DivergentTermBlocks.
+  // TODO In the future, this should not be a DenseMap with ValueClassification as the value. This is only 1 bit of information, but because the DenseMap's bucket (DenseMapPair) is a std::pair, struct padding means that each bucket is 16B big, instead of just 8B for a DenseSet<ConstValueRefT>, which would suffice for tracking divergent values only. This is a significant performance problem, and while it could be solved by using two DenseSets, one for divergent values and one for uniform ones, that solution requires managing redundant state in two separate data structures, and is thus highly error prone. Instead, the DenseMap's BucketT template parameter should be extended, so that it can support non std::pair buckets, and then a tagged pointer such as an llvm::PointerIntPair<ConstValueRefT, 1, ValueClassification> should be used as the bucket type. This has one additional problem, in that ConstValueRefT is not a pointer for the MIR analysis, but only a 4B llvm::Register In that case, the bucket should be a std::pair<ConstValueRefT, ValueClassification>, for 8B in total as well.
+  //      To summarize: KnownValues should override the BucketT of the DenseMap with a struct type that is templated such that it either holds a PointerIntPair<ConstValueRefT, 1, ValueClassification>, or a std::pair<Register, ValueClassification>. This struct should provide a unified interface for accessing each part (ConstValueRefT, ValueClassification) of the conceptual pair.
+  DenseMap<ConstValueRefT, ValueClassification::Type> KnownValues;
   SmallPtrSet<const BlockT *, 32> DivergentTermBlocks;
 
-  // Internal worklist for divergence propagation.
-  std::vector<const InstructionT *> Worklist;
+  // Internal worklists for divergence/uniformity propagation.
+  std::vector<const InstructionT *> DivWorklist;
 
   /// \brief Mark \p Term as divergent and push all Instructions that become
   /// divergent as a result on the worklist.
@@ -478,8 +507,13 @@ private:
 
   bool usesValueFromCycle(const InstructionT &I, const CycleT &DefCycle) const;
 
-  /// \brief Whether \p Def is divergent when read in \p ObservingBlock.
+  /// \brief Whether \p Def is divergent when read/used in \p ObservingBlock.
   bool isTemporalDivergent(const BlockT &ObservingBlock,
+                           const InstructionT &Def) const;
+
+  /// \brief If \p Def is divergent when read/used in \p ObservingBlock, (if isTemporalDivergent),
+  /// return the cycle that causes temporal divergence, or nullptr if the use is not temporally divergent.
+  const CycleT* getTemporallyDivergentCycle(const BlockT &ObservingBlock,
                            const InstructionT &Def) const;
 };
 
@@ -810,17 +844,36 @@ void GenericUniformityAnalysisImpl<ContextT>::markDivergent(
   }
 
   if (Marked)
-    Worklist.push_back(&I);
+    DivWorklist.push_back(&I);
 }
 
 template <typename ContextT>
 bool GenericUniformityAnalysisImpl<ContextT>::markDivergent(
     ConstValueRefT Val) {
-  if (DivergentValues.insert(Val).second) {
+  auto Inserted = KnownValues.try_emplace(Val, ValueClassification::DIVERGENT);
+  if(Inserted.second){
     LLVM_DEBUG(dbgs() << "marked divergent: " << Context.print(Val) << "\n");
     return true;
   }
-  return false;
+
+  if(Inserted.first->second == ValueClassification::DIVERGENT){
+    LLVM_DEBUG(dbgs() << "already marked divergent: " << Context.print(Val) << "\n");
+    return false;
+  }
+
+  Inserted.first->second = ValueClassification::DIVERGENT;
+  return true;
+}
+
+
+template <typename ContextT>
+void GenericUniformityAnalysisImpl<ContextT>::initiallyMarkUniform(
+    ConstValueRefT Val) {
+  assert((!isa<Instruction>(Val) || !dyn_cast<Instruction>(Val)->isTerminator()) && "Terminators should not be tracked in KnownValues");
+  // TODO for now: only allow marking previously unknown values as uniform (see UniformityAnalysisUpdater::isDivergent)
+  if (KnownValues.try_emplace(Val, ValueClassification::UNIFORM).second) {
+    LLVM_DEBUG(dbgs() << "marked uniform: " << Context.print(Val) << "\n");
+  }
 }
 
 template <typename ContextT>
@@ -1062,10 +1115,25 @@ bool GenericUniformityAnalysisImpl<ContextT>::isTemporalDivergent(
 }
 
 template <typename ContextT>
+const typename GenericCycleInfo<ContextT>::CycleT* GenericUniformityAnalysisImpl<ContextT>::getTemporallyDivergentCycle(
+    const BlockT &ObservingBlock, const InstructionT &Def) const {
+  const BlockT *DefBlock = Def.getParent();
+  for (const CycleT *Cycle = CI.getCycle(DefBlock);
+       Cycle && !Cycle->contains(&ObservingBlock);
+       Cycle = Cycle->getParentCycle()) {
+    if (DivergentExitCycles.contains(Cycle)) {
+      return Cycle;
+    }
+  }
+  return nullptr;
+}
+
+
+template <typename ContextT>
 void GenericUniformityAnalysisImpl<ContextT>::analyzeControlDivergence(
     const InstructionT &Term) {
   const auto *DivTermBlock = Term.getParent();
-  DivergentTermBlocks.insert(DivTermBlock);
+  assert(DivergentTermBlocks.contains(DivTermBlock) && "divergent term block should already be inserted into the map here");
   LLVM_DEBUG(dbgs() << "analyzeControlDiv " << Context.print(DivTermBlock)
                     << "\n");
 
@@ -1119,18 +1187,26 @@ void GenericUniformityAnalysisImpl<ContextT>::analyzeControlDivergence(
 
 template <typename ContextT>
 void GenericUniformityAnalysisImpl<ContextT>::compute() {
-  // Initialize worklist.
-  auto DivValuesCopy = DivergentValues;
-  for (const auto DivVal : DivValuesCopy) {
+  // Initialize worklist with divergent values.
+  // It is necessary to copy the initial divergent values before the `pushUsers()` loop below, as `pushUsers()` inserts into `KnownValues`, so iterating over `KnownValues` in that loop would cause iterator invalidation problems.
+  DenseSet<ConstValueRefT> DivValues;
+  for(auto& Entry: KnownValues)
+    if(Entry.second == ValueClassification::DIVERGENT)
+      DivValues.insert(Entry.first);
+
+  for (const auto DivVal : DivValues) {
     assert(isDivergent(DivVal) && "Worklist invariant violated!");
     pushUsers(DivVal);
   }
 
-  // All values on the Worklist are divergent.
-  // Their users may not have been updated yet.
-  while (!Worklist.empty()) {
-    const InstructionT *I = Worklist.back();
-    Worklist.pop_back();
+  propagateSeededWorklistDivergence();
+}
+
+template <typename ContextT>
+void GenericUniformityAnalysisImpl<ContextT>::propagateSeededWorklistDivergence() {
+  while (!DivWorklist.empty()) {
+    const InstructionT *I = DivWorklist.back();
+    DivWorklist.pop_back();
 
     LLVM_DEBUG(dbgs() << "worklist pop: " << Context.print(I) << "\n");
 
@@ -1175,23 +1251,30 @@ void GenericUniformityAnalysisImpl<ContextT>::print(raw_ostream &OS) const {
   constexpr bool IsMIR = std::is_same<InstructionT, MachineInstr>::value;
   std::string NewLine = IsMIR ? "" : "\n";
 
+  bool HasValueDivergence = llvm::is_contained(KnownValues.values(), ValueClassification::DIVERGENT);
+
   // Control flow instructions may be divergent even if their inputs are
   // uniform. Thus, although exceedingly rare, it is possible to have a program
   // with no divergent values but with divergent control structures.
-  if (DivergentValues.empty() && DivergentTermBlocks.empty() &&
+  if (!HasValueDivergence && DivergentTermBlocks.empty() &&
       DivergentExitCycles.empty()) {
     OS << "ALL VALUES UNIFORM\n";
     return;
   }
 
-  for (const auto &entry : DivergentValues) {
-    const BlockT *parent = Context.getDefBlock(entry);
+  for (const auto &entry : KnownValues) {
+    if(entry.second != ValueClassification::DIVERGENT)
+      continue;
+
+    const auto& val = entry.first;
+
+    const BlockT *parent = Context.getDefBlock(val);
     if (!parent) {
       if (!haveDivergentArgs) {
         OS << "DIVERGENT ARGUMENTS:\n";
         haveDivergentArgs = true;
       }
-      OS << "  DIVERGENT: " << Context.print(entry) << '\n';
+      OS << "  DIVERGENT: " << Context.print(val) << '\n';
     }
   }
 
@@ -1255,11 +1338,6 @@ iterator_range<
 GenericUniformityInfo<ContextT>::getTemporalDivergenceList() const {
   return make_range(DA->TemporalDivergenceList.begin(),
                     DA->TemporalDivergenceList.end());
-}
-
-template <typename ContextT>
-bool GenericUniformityInfo<ContextT>::hasDivergence() const {
-  return DA->hasDivergence();
 }
 
 template <typename ContextT>

@@ -15,15 +15,20 @@
 #include "AMDGPU.h"
 #include "AMDGPUTargetMachine.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
+#include "llvm/Analysis/UniformityAnalysisUpdater.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/CycleInfo.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <cstdlib>
 
 #define DEBUG_TYPE "amdgpu-late-codegenprepare"
 
@@ -48,14 +53,14 @@ class AMDGPULateCodeGenPrepare
   const GCNSubtarget &ST;
 
   AssumptionCache *const AC;
-  UniformityInfo &UA;
+  UniformityAnalysisUpdater &UAUpdater;
 
   SmallVector<WeakTrackingVH, 8> DeadInsts;
 
 public:
   AMDGPULateCodeGenPrepare(Function &F, const GCNSubtarget &ST,
-                           AssumptionCache *AC, UniformityInfo &UA)
-      : F(F), DL(F.getDataLayout()), ST(ST), AC(AC), UA(UA) {}
+                           AssumptionCache *AC, UniformityAnalysisUpdater &UA)
+      : F(F), DL(F.getDataLayout()), ST(ST), AC(AC), UAUpdater(UA) {}
   bool run();
   bool visitInstruction(Instruction &) { return false; }
 
@@ -103,7 +108,8 @@ public:
   /// defined by \p I, and coerce to legal types if necessary. For problematic
   /// PHI node, we coerce all incoming values in a single invocation.
   bool optimizeLiveType(Instruction *I,
-                        SmallVectorImpl<WeakTrackingVH> &DeadInsts);
+                        SmallVectorImpl<WeakTrackingVH> &DeadInsts,
+                        UniformityAnalysisUpdater &UAUpdater);
 
   // Whether or not the type should be replaced to avoid inefficient
   // legalization code
@@ -189,7 +195,7 @@ bool AMDGPULateCodeGenPrepare::run() {
   for (auto &BB : reverse(F))
     for (Instruction &I : make_early_inc_range(reverse(BB))) {
       Changed |= !HasScalarSubwordLoads && visit(I);
-      Changed |= LRO.optimizeLiveType(&I, DeadInsts);
+      Changed |= LRO.optimizeLiveType(&I, DeadInsts, UAUpdater);
     }
 
   RecursivelyDeleteTriviallyDeadInstructionsPermissive(DeadInsts);
@@ -283,7 +289,7 @@ Value *LiveRegOptimizer::convertFromOptType(Type *ConvertType, Instruction *V,
 }
 
 bool LiveRegOptimizer::optimizeLiveType(
-    Instruction *I, SmallVectorImpl<WeakTrackingVH> &DeadInsts) {
+    Instruction *I, SmallVectorImpl<WeakTrackingVH> &DeadInsts, UniformityAnalysisUpdater& UAUpdater) {
   SmallVector<Instruction *, 4> Worklist;
   SmallPtrSet<PHINode *, 4> PhiNodes;
   SmallPtrSet<Instruction *, 4> Defs;
@@ -430,7 +436,10 @@ bool LiveRegOptimizer::optimizeLiveType(
           }
         }
         assert(NewVal);
+        Value* OldVal = Op;
         U->setOperand(OpIdx, NewVal);
+        // TODO dyn_cast - should always be allowed though? Replace with cast<> in that case
+        UAUpdater.informAboutRAUW(OldVal, dyn_cast<Instruction>(NewVal));
       }
     }
   }
@@ -459,7 +468,8 @@ bool AMDGPULateCodeGenPrepare::canWidenScalarExtLoad(LoadInst &LI) const {
   if (LI.getAlign() < DL.getABITypeAlign(Ty))
     return false;
   // It should be uniform, i.e. a scalar load.
-  return UA.isUniform(&LI);
+  return UAUpdater.isUniform(&LI);
+  //return UAUpdater.Info.isUniform(&LI);
 }
 
 bool AMDGPULateCodeGenPrepare::visitLoadInst(LoadInst &LI) {
@@ -522,13 +532,16 @@ AMDGPULateCodeGenPreparePass::run(Function &F, FunctionAnalysisManager &FAM) {
   const GCNSubtarget &ST = TM.getSubtarget<GCNSubtarget>(F);
   AssumptionCache &AC = FAM.getResult<AssumptionAnalysis>(F);
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
+  UniformityAnalysisUpdater UIUpdater(UI, &F.getContext());
 
-  bool Changed = AMDGPULateCodeGenPrepare(F, ST, &AC, UI).run();
+  bool Changed = AMDGPULateCodeGenPrepare(F, ST, &AC, UIUpdater).run();
 
   if (!Changed)
     return PreservedAnalyses::all();
   PreservedAnalyses PA = PreservedAnalyses::none();
+
   PA.preserveSet<CFGAnalyses>();
+  PA.preserve<UniformityInfoAnalysis>();
   return PA;
 }
 
@@ -546,9 +559,9 @@ public:
     AU.addRequired<TargetPassConfig>();
     AU.addRequired<AssumptionCacheTracker>();
     AU.addRequired<UniformityInfoWrapperPass>();
-    // This pass makes changes that can invalidate Uniformity Analysis,
-    // so don't setPreserveAll() here.
     AU.setPreservesCFG();
+    // This pass utilizes the UniformityAnalysisUpdater to keep it up-to-date
+    AU.addPreserved<UniformityInfoWrapperPass>();
   }
 
   bool runOnFunction(Function &F) override;
@@ -567,7 +580,9 @@ bool AMDGPULateCodeGenPrepareLegacy::runOnFunction(Function &F) {
   UniformityInfo &UI =
       getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
 
-  return AMDGPULateCodeGenPrepare(F, ST, &AC, UI).run();
+  UniformityAnalysisUpdater UIUpdater(UI, &F.getContext());
+
+  return AMDGPULateCodeGenPrepare(F, ST, &AC, UIUpdater).run();
 }
 
 INITIALIZE_PASS_BEGIN(AMDGPULateCodeGenPrepareLegacy, DEBUG_TYPE,

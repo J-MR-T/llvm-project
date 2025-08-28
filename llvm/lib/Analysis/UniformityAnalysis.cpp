@@ -30,17 +30,25 @@ bool llvm::GenericUniformityAnalysisImpl<SSAContext>::markDefsDivergent(
 }
 
 template <> void llvm::GenericUniformityAnalysisImpl<SSAContext>::initialize() {
+  // TODO Once the MIR version supports the updater, it also needs to mark some values uniform initially
+
   for (auto &I : instructions(F)) {
-    if (TTI->isSourceOfDivergence(&I))
+    if (TTI->isSourceOfDivergence(&I)){
       markDivergent(I);
-    else if (TTI->isAlwaysUniform(&I))
+      continue;
+    }
+
+    if (TTI->isAlwaysUniform(&I))
       addUniformOverride(I);
   }
-  for (auto &Arg : F.args()) {
-    if (TTI->isSourceOfDivergence(&Arg)) {
+
+  // NOTE: the markDivergent() call here does not add anything to the worklist. This is done separately in GenericUniformityAnalysisImpl<ContextT>::compute()
+  for (auto &Arg : F.args())
+    if (TTI->isSourceOfDivergence(&Arg))
       markDivergent(&Arg);
-    }
-  }
+    // Arguments are marked as assumed-uniform immediately, as they cannot have divergence propagated to them, it must be inherent (<-> isSourceOfDivergence call above)
+    else
+      initiallyMarkUniform(&Arg);
 }
 
 template <>

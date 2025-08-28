@@ -333,6 +333,7 @@ bool AMDGPUUnifyDivergentExitNodes::runOnFunction(Function &F) {
     DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   const auto &PDT =
       getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+
   const auto &UA = getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
   const auto *TranformInfo =
       &getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);

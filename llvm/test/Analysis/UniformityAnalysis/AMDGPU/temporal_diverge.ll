@@ -12,7 +12,9 @@ entry:
   br label %H
 
 H:
+; CHECK-NOT: DIVERGENT: %uni.merge.h
   %uni.merge.h = phi i32 [ 0, %entry ], [ %uni.inc, %H ]
+; CHECK-NOT: DIVERGENT: %uni.inc
   %uni.inc = add i32 %uni.merge.h, 1
 ; CHECK: DIVERGENT: %div.exitx =
   %div.exitx = icmp slt i32 %tid, 0
@@ -61,7 +63,9 @@ entry:
   br i1 %uni.cond, label %H, label %Y
 
 H:
+; CHECK-NOT: DIVERGENT: %uni.merge.h
   %uni.merge.h = phi i32 [ 0, %entry ], [ %uni.inc, %H ]
+; CHECK-NOT: DIVERGENT: %uni.inc
   %uni.inc = add i32 %uni.merge.h, 1
 ; CHECK: DIVERGENT: %div.exitx =
   %div.exitx = icmp slt i32 %tid, 0

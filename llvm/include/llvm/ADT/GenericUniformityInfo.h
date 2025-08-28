@@ -27,6 +27,7 @@ template <typename ImplT> struct GenericUniformityAnalysisImplDeleter {
 };
 
 template <typename ContextT> class GenericUniformityInfo {
+    friend class UniformityAnalysisUpdater;
 public:
   using BlockT = typename ContextT::BlockT;
   using FunctionT = typename ContextT::FunctionT;
@@ -53,9 +54,6 @@ public:
     DA->initialize();
     DA->compute();
   }
-
-  /// Whether any divergence was detected.
-  bool hasDivergence() const;
 
   /// The GPU kernel this analysis result is for
   const FunctionT &getFunction() const;
