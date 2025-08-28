@@ -37,6 +37,7 @@
 #include "llvm/IR/TrackingMDRef.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/SandboxIR/Context.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/StringSaver.h"
@@ -1607,8 +1608,15 @@ public:
   }
 };
 
+template<typename ContextCallbackFnTy>
+class ContextCallbackOwnershipToken;
+
 class LLVMContextImpl {
 public:
+  bool HasCallbacks = false;
+  SmallVector<ContextCallbackOwnershipToken<std::function<void(Value*, Value*)>>*> AfterRAUWCallbacks;
+  SmallVector<ContextCallbackOwnershipToken<std::function<void(Value*)>>*> BeforeDeleteCallbacks;
+
   /// OwnedModules - The set of modules instantiated in this context, and which
   /// will be automatically deleted if this context is deleted.
   SmallPtrSet<Module *, 4> OwnedModules;

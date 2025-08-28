@@ -32,6 +32,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/ContextCallbacks.h"
 #include <algorithm>
 
 using namespace llvm;
@@ -74,11 +75,17 @@ Value::Value(Type *ty, unsigned scid)
 }
 
 Value::~Value() {
+  auto& pImpl = *this->getContext().pImpl;
+
   // Notify all ValueHandles (if present) that this value is going away.
   if (HasValueHandle)
     ValueHandleBase::ValueIsDeleted(this);
   if (isUsedByMetadata())
     ValueAsMetadata::handleDeletion(this);
+
+  if(LLVM_UNLIKELY(pImpl.HasCallbacks))
+    for(auto* Callback: pImpl.BeforeDeleteCallbacks)
+      (*Callback)(this);
 
   // Remove associated metadata from context.
   if (HasMetadata)
@@ -519,6 +526,8 @@ void Value::doRAUW(Value *New, ReplaceMetadataUses ReplaceMetaUses) {
   assert(New->getType() == getType() &&
          "replaceAllUses of value with new value of different type!");
 
+  auto& pImpl = *this->getContext().pImpl;
+
   // Notify all ValueHandles (if present) that this value is going away.
   if (HasValueHandle)
     ValueHandleBase::ValueIsRAUWd(this, New);
@@ -541,6 +550,10 @@ void Value::doRAUW(Value *New, ReplaceMetadataUses ReplaceMetaUses) {
 
   if (BasicBlock *BB = dyn_cast<BasicBlock>(this))
     BB->replaceSuccessorsPhiUsesWith(cast<BasicBlock>(New));
+
+  if(LLVM_UNLIKELY(pImpl.HasCallbacks))
+    for(auto* Callback: pImpl.AfterRAUWCallbacks)
+      (*Callback)(this, New);
 }
 
 void Value::replaceAllUsesWith(Value *New) {
